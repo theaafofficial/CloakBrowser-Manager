@@ -73,6 +73,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [duplicating, setDuplicating] = useState(false);
   const [duplicateMenuOpen, setDuplicateMenuOpen] = useState(false);
   const duplicateMenuRef = useRef<HTMLDivElement>(null);
+  const duplicateTriggerRef = useRef<HTMLButtonElement>(null);
   const [testingProxy, setTestingProxy] = useState(false);
   const [proxyTest, setProxyTest] = useState<ProxyTestResult | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -194,7 +195,11 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
       if (!duplicateMenuRef.current?.contains(e.target as Node)) setDuplicateMenuOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setDuplicateMenuOpen(false);
+      if (e.key !== "Escape") return;
+      setDuplicateMenuOpen(false);
+      // A focused menu item is about to unmount; hand focus back to the trigger
+      // so keyboard users are not dropped onto the document body.
+      duplicateTriggerRef.current?.focus();
     };
     document.addEventListener("mousedown", onPointerDown);
     document.addEventListener("keydown", onKey);
@@ -284,6 +289,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 <span>{duplicating ? "Duplicating..." : "Duplicate"}</span>
               </button>
               <button
+                ref={duplicateTriggerRef}
                 type="button"
                 onClick={() => setDuplicateMenuOpen((open) => !open)}
                 disabled={duplicating}

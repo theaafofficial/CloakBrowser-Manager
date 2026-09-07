@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from starlette.testclient import TestClient
 
+from backend import database as db
 from backend import main
-from backend.browser_manager import RunningProfile
+from backend.models import ProfileDuplicateRequest
+from backend.browser_manager import BrowserManager, RunningProfile
 from backend.runtime import RuntimeConfig
 
 
@@ -133,7 +138,7 @@ def test_delete_profile_stops_running(app_client: TestClient):
     mock_running.ws_port = 6100
     mock_running.cdp_port = 5100
     main.browser_mgr.running[pid] = mock_running
-    main.browser_mgr.stop = AsyncMock()
+    main.browser_mgr.stop = AsyncMock(side_effect=lambda p: main.browser_mgr.running.pop(p, None))
 
     resp = app_client.delete(f"/api/profiles/{pid}")
     assert resp.status_code == 200
@@ -838,7 +843,7 @@ def test_reset_profile_stops_running(app_client: TestClient):
     mock_running.ws_port = 6100
     mock_running.cdp_port = 5100
     main.browser_mgr.running[pid] = mock_running
-    main.browser_mgr.stop = AsyncMock()
+    main.browser_mgr.stop = AsyncMock(side_effect=lambda p: main.browser_mgr.running.pop(p, None))
     resp = app_client.post(f"/api/profiles/{pid}/reset")
     assert resp.status_code == 200
     main.browser_mgr.stop.assert_called_once_with(pid)
@@ -993,7 +998,7 @@ def test_duplicate_profile_config_only_is_allowed_while_running(app_client: Test
     assert resp.status_code == 201
 
 
-def test_duplicate_profile_rolls_back_clone_when_copy_fails(
+def test_duplicate_profile_leaves_nothing_behind_when_copy_fails(
     app_client: TestClient, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
 ):
     src = app_client.post("/api/profiles", json={"name": "Src"}).json()
@@ -1003,12 +1008,154 @@ def test_duplicate_profile_rolls_back_clone_when_copy_fails(
     resp = app_client.post(f"/api/profiles/{src['id']}/duplicate", json={"include_browser_state": True})
     assert resp.status_code == 500
     assert "disk full" in resp.json()["detail"]
-    # The half-made clone is gone from the DB and from disk
+    # No clone row was ever written, and the clone directory does not linger
     assert [p["id"] for p in app_client.get("/api/profiles").json()] == [src["id"]]
     assert [d.name for d in (tmp_db / "profiles").iterdir()] == [src["id"]]
+    # The source is untouched and can still be launched (the hold was released)
+    assert not main.browser_mgr._held
 
 
 def test_duplicate_profile_rejects_unknown_fields(app_client: TestClient):
     src = app_client.post("/api/profiles", json={"name": "Src"}).json()
     resp = app_client.post(f"/api/profiles/{src['id']}/duplicate", json={"copy_state": True})
     assert resp.status_code == 422
+
+
+# ── Duplicate: lifecycle safety ──────────────────────────────────────────────
+# These exercise the route coroutines directly so a copy can be paused mid-way
+# and other requests interleaved with it.
+
+_WITH_STATE = ProfileDuplicateRequest(include_browser_state=True)
+
+
+def _seeded_source() -> dict:
+    src = db.create_profile(name="Src", fingerprint_seed=4242)
+    _seed_browser_state(Path(src["user_data_dir"]))
+    return src
+
+
+class _PausableCopy:
+    """Monkeypatch target for main._copy_browser_state: blocks until released."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._real = main._copy_browser_state
+
+    def __call__(self, src: Path, dst: Path) -> None:
+        self.started.set()
+        assert self.release.wait(5), "copy was never released"
+        self._real(src, dst)
+
+
+@pytest.fixture()
+def real_lifecycle(monkeypatch: pytest.MonkeyPatch):
+    """Earlier tests swap browser_mgr.launch/stop for AsyncMocks and never put them
+    back; these tests need the real state machine (launching/stopping sets)."""
+    mgr = main.browser_mgr
+    monkeypatch.setattr(mgr, "launch", BrowserManager.launch.__get__(mgr))
+    monkeypatch.setattr(mgr, "stop", BrowserManager.stop.__get__(mgr))
+    return mgr
+
+
+async def _status_of(coro) -> int:
+    try:
+        await coro
+    except HTTPException as exc:
+        return exc.status_code
+    return 200
+
+
+async def test_duplicate_state_refuses_a_launching_source(tmp_db: Path):
+    """launch() registers in `running` only at the end; the gap must count as active."""
+    src = _seeded_source()
+    main.browser_mgr._launching.add(src["id"])
+    try:
+        assert await _status_of(main.duplicate_profile(src["id"], _WITH_STATE)) == 409
+    finally:
+        main.browser_mgr._launching.discard(src["id"])
+    assert [p["id"] for p in db.list_profiles()] == [src["id"]]
+    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [src["id"]]
+
+
+async def test_duplicate_state_refuses_a_source_still_closing(tmp_db: Path, real_lifecycle, monkeypatch: pytest.MonkeyPatch):
+    """stop() pops `running` before the context closes; Chrome is still flushing then."""
+    src = _seeded_source()
+    closing, finish = asyncio.Event(), asyncio.Event()
+
+    async def blocked_close(*_args):
+        closing.set()
+        await finish.wait()
+
+    monkeypatch.setattr(main.browser_mgr, "_close_context", blocked_close)
+    main.browser_mgr.running[src["id"]] = RunningProfile(src["id"], object(), 19001, capture_preview=False)
+    stop = asyncio.create_task(main.browser_mgr.stop(src["id"]))
+    await asyncio.wait_for(closing.wait(), 2)
+    try:
+        assert not stop.done()
+        assert src["id"] not in main.browser_mgr.running  # the reviewer's exact window
+        assert await _status_of(main.duplicate_profile(src["id"], _WITH_STATE)) == 409
+    finally:
+        finish.set()
+        await stop
+    # Once the close has really finished, the copy is allowed
+    clone = await main.duplicate_profile(src["id"], _WITH_STATE)
+    assert (Path(clone.user_data_dir) / "Default" / "Cookies").read_text() == "session=abc"
+
+
+async def test_duplicate_state_clone_is_unlisted_until_the_copy_completes(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    src = _seeded_source()
+    copy = _PausableCopy()
+    monkeypatch.setattr(main, "_copy_browser_state", copy)
+    task = asyncio.create_task(main.duplicate_profile(src["id"], _WITH_STATE))
+    assert await asyncio.to_thread(copy.started.wait, 2)
+    try:
+        # Mid-copy: the clone does not exist for anyone — not listed, not addressable
+        assert [p.id for p in await main.list_profiles()] == [src["id"]]
+    finally:
+        copy.release.set()
+    clone = await task
+    assert [p.id for p in await main.list_profiles()] == [clone.id, src["id"]]
+    assert (Path(clone.user_data_dir) / "Default" / "Cookies").read_text() == "session=abc"
+
+
+async def test_duplicate_state_holds_the_source_for_the_whole_copy(
+    tmp_db: Path, real_lifecycle, monkeypatch: pytest.MonkeyPatch
+):
+    """launch / reset / delete of the source are refused until the copy is done."""
+    src = _seeded_source()
+    copy = _PausableCopy()
+    monkeypatch.setattr(main, "_copy_browser_state", copy)
+    task = asyncio.create_task(main.duplicate_profile(src["id"], _WITH_STATE))
+    assert await asyncio.to_thread(copy.started.wait, 2)
+    try:
+        assert await _status_of(main.reset_profile(src["id"])) == 409
+        assert await _status_of(main.delete_profile(src["id"])) == 409
+        assert await _status_of(main.launch_profile(src["id"])) == 409
+        assert await _status_of(main.duplicate_profile(src["id"], _WITH_STATE)) == 409
+        # ...while a config-only duplicate never touches the directory and is fine
+        assert (await main.duplicate_profile(src["id"], None)).name == "Src (copy)"
+    finally:
+        copy.release.set()
+    clone = await task
+    # The snapshot is intact: the interleaved reset never got to wipe the source
+    assert (Path(clone.user_data_dir) / "Default" / "Cookies").read_text() == "session=abc"
+    assert (Path(src["user_data_dir"]) / "Default" / "Cookies").read_text() == "session=abc"
+    # The hold is released afterwards: a reset now goes through
+    assert await _status_of(main.reset_profile(src["id"])) == 200
+    assert not main.browser_mgr._held
+
+
+async def test_reset_and_delete_refuse_a_profile_mid_launch(tmp_db: Path):
+    """Same guard, same reason: wiping or removing a dir Chrome is initialising is unsafe."""
+    src = _seeded_source()
+    main.browser_mgr._launching.add(src["id"])
+    try:
+        assert await _status_of(main.reset_profile(src["id"])) == 409
+        assert await _status_of(main.delete_profile(src["id"])) == 409
+    finally:
+        main.browser_mgr._launching.discard(src["id"])
+    assert (Path(src["user_data_dir"]) / "Default" / "Cookies").read_text() == "session=abc"
+    assert db.get_profile(src["id"]) is not None

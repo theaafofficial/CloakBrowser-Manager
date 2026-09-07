@@ -340,3 +340,20 @@ def test_reset_profile_bumps_updated_at(tmp_db: Path):
 
 def test_reset_profile_not_found(tmp_db: Path):
     assert db.reset_profile("nonexistent") is None
+
+
+def test_create_profile_honours_explicit_id(tmp_db: Path):
+    pid = db.new_profile_id()
+    p = db.create_profile(name="Pre-minted", profile_id=pid)
+    assert p["id"] == pid
+    assert p["user_data_dir"] == db.user_data_dir_for(pid)
+    assert db.get_profile(pid)["name"] == "Pre-minted"
+
+
+def test_duplicate_profile_honours_new_id(tmp_db: Path):
+    src = db.create_profile(name="Src", fingerprint_seed=7)
+    pid = db.new_profile_id()
+    clone = db.duplicate_profile(src["id"], new_id=pid)
+    assert clone["id"] == pid
+    assert clone["fingerprint_seed"] == 7
+    assert clone["user_data_dir"] == db.user_data_dir_for(pid)

@@ -39,6 +39,7 @@ from cloakbrowser.license import CloakBrowserLicenseError
 
 from .browser_manager import (
     BrowserManager,
+    ProfileBusyError,
     SCREENSHOT_FILENAME,
     is_seat_limit_error,
     license_error_detail,
@@ -622,12 +623,15 @@ async def delete_profile(profile_id: str):
 
     user_data_dir = Path(profile["user_data_dir"])
 
-    # DB first — if this fails, filesystem is untouched
-    db.delete_profile(profile_id)
-
-    # Then clean up disk
-    if user_data_dir.exists():
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            # DB first — if this fails, filesystem is untouched
+            db.delete_profile(profile_id)
+            # Then clean up disk
+            if user_data_dir.exists():
+                shutil.rmtree(user_data_dir, ignore_errors=True)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {"ok": True}
 
@@ -681,13 +685,16 @@ async def reset_profile(profile_id: str):
 
     user_data_dir = Path(profile["user_data_dir"])
     default_dir = user_data_dir / "Default"
-    if default_dir.exists():
-        for fname in _RESET_STATE_FILES:
-            (default_dir / fname).unlink(missing_ok=True)
-        for dname in _RESET_STATE_DIRS:
-            shutil.rmtree(default_dir / dname, ignore_errors=True)
-
-    updated = db.reset_profile(profile_id)
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            if default_dir.exists():
+                for fname in _RESET_STATE_FILES:
+                    (default_dir / fname).unlink(missing_ok=True)
+                for dname in _RESET_STATE_DIRS:
+                    shutil.rmtree(default_dir / dname, ignore_errors=True)
+            updated = db.reset_profile(profile_id)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to reset profile")
     return _profile_response(updated)
@@ -719,36 +726,58 @@ async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None
     Settings, tags, notes and the same fingerprint seed are always copied. With
     ``include_browser_state`` the source's user_data_dir (cookies, logged-in
     sessions, history) is copied too, so the clone launches as the same identity
-    and the same session; the source must be stopped so the copy is consistent.
-    Without it (the default) the clone gets a fresh, empty user_data_dir.
+    and the same session. Without it (the default) the clone gets a fresh, empty
+    user_data_dir.
+
+    The state copy is a consistent snapshot: the source is held stopped for the
+    whole copy (launch / reset / delete of it are refused meanwhile), and the
+    clone's row is written only after its directory is complete, so a half-built
+    clone is never listed, launched or deleted.
     """
     profile = db.get_profile(profile_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     include_state = bool(req and req.include_browser_state)
-    if include_state and profile_id in browser_mgr.running:
+
+    if not include_state:
+        clone = db.duplicate_profile(profile_id)
+        if not clone:
+            raise HTTPException(status_code=500, detail="Failed to duplicate profile")
+        return _profile_response(clone)
+
+    if browser_mgr.is_active(profile_id):
         raise HTTPException(
             status_code=409, detail="Stop the profile before duplicating its browser state"
         )
 
-    clone = db.duplicate_profile(profile_id)
-    if not clone:
-        raise HTTPException(status_code=500, detail="Failed to duplicate profile")
-
+    # Mint the clone's id up front so its directory can be filled BEFORE the row
+    # exists: nothing can list, launch, reset or delete a profile the DB has not
+    # heard of, so an unfinished clone is unreachable.
+    clone_id = db.new_profile_id()
     src_dir = Path(profile["user_data_dir"])
-    if include_state and src_dir.is_dir():
-        dst_dir = Path(clone["user_data_dir"])
-        try:
-            # Off the event loop: a profile with a fat cache takes seconds to copy.
-            await asyncio.to_thread(_copy_browser_state, src_dir, dst_dir)
-        except OSError as exc:
-            # Roll back so a half-copied clone never shows up in the list.
-            db.delete_profile(clone["id"])
-            shutil.rmtree(dst_dir, ignore_errors=True)
-            logger.exception("Failed to copy browser state for duplicate of %s", profile_id)
-            raise HTTPException(
-                status_code=500, detail=f"Failed to copy browser state: {exc}"
-            ) from exc
+    dst_dir = Path(db.user_data_dir_for(clone_id))
+    try:
+        async with browser_mgr.hold_stopped(profile_id):
+            if src_dir.is_dir():
+                # Off the event loop: a profile with a fat cache takes seconds to copy.
+                await asyncio.to_thread(_copy_browser_state, src_dir, dst_dir)
+            clone = db.duplicate_profile(profile_id, new_id=clone_id)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        # No row to roll back — it is only written after a good copy — but the
+        # directory must not outlive a failed attempt.
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        logger.exception("Failed to duplicate browser state of %s", profile_id)
+        detail = (
+            f"Failed to copy browser state: {exc}"
+            if isinstance(exc, OSError)
+            else "Failed to duplicate profile"
+        )
+        raise HTTPException(status_code=500, detail=detail) from exc
+    if not clone:
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail="Failed to duplicate profile")
     return _profile_response(clone)
 
 
@@ -772,6 +801,8 @@ async def launch_profile(profile_id: str):
         logger.warning("License denial launching profile %s: %s", profile_id, exc)
         detail = license_error_detail(exc)
         raise HTTPException(status_code=402 if is_seat_limit_error(exc) else 403, detail=detail)
+    except ProfileBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:

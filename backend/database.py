@@ -171,10 +171,24 @@ def _json_list(value: Any) -> list[str]:
     return parsed if isinstance(parsed, list) else []
 
 
-def create_profile(name: str, fingerprint_seed: int | None = None, **fields: Any) -> dict[str, Any]:
-    profile_id = str(uuid.uuid4())
+def new_profile_id() -> str:
+    return str(uuid.uuid4())
+
+
+def user_data_dir_for(profile_id: str) -> str:
+    """Where a profile keeps its Chrome user data. The one place this layout lives."""
+    return str(DATA_DIR / "profiles" / profile_id)
+
+
+def create_profile(
+    name: str, fingerprint_seed: int | None = None, *, profile_id: str | None = None, **fields: Any
+) -> dict[str, Any]:
+    """Insert a new profile. ``profile_id`` lets a caller mint the id (and so the
+    user_data_dir) ahead of the row — used to fill a clone's directory BEFORE it
+    becomes visible, so a half-built profile is never listed."""
+    profile_id = profile_id or new_profile_id()
     seed = fingerprint_seed if fingerprint_seed is not None else random.randint(10000, 99999)
-    user_data_dir = str(DATA_DIR / "profiles" / profile_id)
+    user_data_dir = user_data_dir_for(profile_id)
     now = _now()
     tags = fields.pop("tags", None) or []
     values = {
@@ -306,13 +320,14 @@ def reset_profile(profile_id: str) -> dict[str, Any] | None:
     return get_profile(profile_id)
 
 
-def duplicate_profile(profile_id: str) -> dict[str, Any] | None:
+def duplicate_profile(profile_id: str, *, new_id: str | None = None) -> dict[str, Any] | None:
     """Clone a profile's config into a brand-new profile. Returns it or None.
 
     Config-only clone: every setting, the tags, notes, and the SAME
     fingerprint_seed are carried over, but no on-disk browser state is copied.
-    create_profile mints a fresh uuid, user_data_dir and sort_order, so the
-    clone launches with an empty profile dir built fresh on first use.
+    create_profile mints a fresh uuid, user_data_dir and sort_order (or takes
+    ``new_id``), so the clone launches with an empty profile dir built fresh on
+    first use — unless the caller filled that dir beforehand.
     """
     src = get_profile(profile_id)
     if src is None:
@@ -326,6 +341,7 @@ def duplicate_profile(profile_id: str) -> dict[str, Any] | None:
     return create_profile(
         name=f"{src['name']} (copy)",
         fingerprint_seed=src["fingerprint_seed"],
+        profile_id=new_id,
         tags=src.get("tags"),
         **fields,
     )

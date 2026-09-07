@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -301,6 +302,10 @@ _MAKE_GOOGLE_DEFAULT_JS = """() => {
 }"""
 
 
+class ProfileBusyError(RuntimeError):
+    """The profile's browser or on-disk state is in use by another operation."""
+
+
 @dataclass
 class RunningProfile:
     profile_id: str
@@ -341,6 +346,10 @@ class BrowserManager:
         # the reason. get_status() returns this so the frontend can show it.
         self._last_errors: dict[str, dict[str, str]] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
+        self._stopping: set[str] = set()  # popped from running, context not yet closed
+        # Profiles whose user_data_dir is reserved by a filesystem operation
+        # (duplicate / reset / delete). launch() refuses these; see hold_stopped().
+        self._held: set[str] = set()
         self._initializing: set[str] = set()  # profile IDs in one-time first-launch setup
         self.vnc = VNCManager(self.runtime.viewer_mode == "vnc")
         self._lock = asyncio.Lock()
@@ -420,6 +429,10 @@ class BrowserManager:
         )
 
         async with self._lock:
+            if profile_id in self._held:
+                raise ProfileBusyError(
+                    f"Profile {profile_id} is busy: its browser state is being copied or reset"
+                )
             if profile_id in self.running or profile_id in self._launching:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
@@ -839,9 +852,14 @@ class BrowserManager:
             # a concurrent launch() clearing _last_errors at its start.
             self._record_denial_if_any(profile_id, running.denial_path)
             self.running.pop(profile_id, None)
+            # Same contract as stop(): active until the dispose is really done.
+            self._stopping.add(profile_id)
 
         logger.info("Browser closed for profile %s, cleaning up", profile_id)
-        await self._dispose_running(running, close_context=True)
+        try:
+            await self._dispose_running(running, close_context=True)
+        finally:
+            self._stopping.discard(profile_id)
 
     def _denial_error(self, denial_path: str | None) -> CloakBrowserLicenseError | None:
         """Read the wrapper's denial file → a license error, or None.
@@ -870,23 +888,63 @@ class BrowserManager:
     async def stop(self, profile_id: str):
         """Stop a running browser instance and release all owned resources."""
         # Pop before close so the close event observes an already-clean state.
+        # _stopping keeps the profile "active" for is_active() until the context
+        # is really closed: Chrome is still flushing its profile dir in between.
         async with self._lock:
             running = self.running.pop(profile_id, None)
+            if running:
+                self._stopping.add(profile_id)
 
         if not running:
             return
 
         logger.info("Stopping profile %s", profile_id)
-        # Final preview capture while the context is still alive (the on-close
-        # path can't screenshot — the browser is already gone by then).
-        if running.capture_preview:
-            try:
-                await self._capture_screenshot(running)
-            except Exception as exc:
-                logger.debug(
-                    "Final preview screenshot failed for %s: %s", profile_id, exc
+        try:
+            # Final preview capture while the context is still alive (the on-close
+            # path can't screenshot — the browser is already gone by then).
+            if running.capture_preview:
+                try:
+                    await self._capture_screenshot(running)
+                except Exception as exc:
+                    logger.debug(
+                        "Final preview screenshot failed for %s: %s", profile_id, exc
+                    )
+            await self._dispose_running(running, close_context=True)
+        finally:
+            self._stopping.discard(profile_id)
+
+    def is_active(self, profile_id: str) -> bool:
+        """True while a browser owns the profile dir: launching, running or still
+        closing. ``running`` alone is not enough — launch() registers there only
+        at the very end, and stop() pops it before the context is closed."""
+        return (
+            profile_id in self.running
+            or profile_id in self._launching
+            or profile_id in self._stopping
+        )
+
+    @asynccontextmanager
+    async def hold_stopped(self, profile_id: str):
+        """Exclusive access to a stopped profile's on-disk state for the block.
+
+        Refuses with ProfileBusyError if a browser is launching, running or
+        closing for the profile, or another hold is active. While held, launch()
+        refuses the profile. Every operation that reads or rewrites a
+        user_data_dir (duplicate, reset, delete) takes this, so a launch and a
+        filesystem operation can never interleave on the same directory.
+        """
+        async with self._lock:
+            if self.is_active(profile_id):
+                raise ProfileBusyError(f"Profile {profile_id} is running or changing state")
+            if profile_id in self._held:
+                raise ProfileBusyError(
+                    f"Profile {profile_id} is busy: its browser state is being copied or reset"
                 )
-        await self._dispose_running(running, close_context=True)
+            self._held.add(profile_id)
+        try:
+            yield
+        finally:
+            self._held.discard(profile_id)
 
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Get running status and viewer capabilities for a profile."""

@@ -1040,12 +1040,21 @@ class _PausableCopy:
     def __init__(self) -> None:
         self.started = threading.Event()
         self.release = threading.Event()
+        self.done = threading.Event()
+        self.dst: Path | None = None
+        self.fail_with: BaseException | None = None  # raise this instead of copying
         self._real = main._copy_browser_state
 
     def __call__(self, src: Path, dst: Path) -> None:
+        self.dst = dst
         self.started.set()
-        assert self.release.wait(5), "copy was never released"
-        self._real(src, dst)
+        try:
+            assert self.release.wait(5), "copy was never released"
+            if self.fail_with is not None:
+                raise self.fail_with
+            self._real(src, dst)
+        finally:
+            self.done.set()
 
 
 @pytest.fixture()
@@ -1145,6 +1154,60 @@ async def test_duplicate_state_holds_the_source_for_the_whole_copy(
     assert (Path(src["user_data_dir"]) / "Default" / "Cookies").read_text() == "session=abc"
     # The hold is released afterwards: a reset now goes through
     assert await _status_of(main.reset_profile(src["id"])) == 200
+    assert not main.browser_mgr._held
+
+
+async def test_duplicate_state_cancellation_waits_for_the_worker_and_cleans_up(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Cancelling the request cannot stop the copy thread. The source must stay
+    held until the worker is done, and the unpublished directory must go."""
+    src = _seeded_source()
+    copy = _PausableCopy()
+    monkeypatch.setattr(main, "_copy_browser_state", copy)
+    task = asyncio.create_task(main.duplicate_profile(src["id"], _WITH_STATE))
+    assert await asyncio.to_thread(copy.started.wait, 2)
+
+    task.cancel()
+    await asyncio.sleep(0.05)
+    try:
+        # Cancelled, but the worker is still copying: nothing may be released yet
+        assert not task.done()
+        assert not copy.done.is_set()
+        assert src["id"] in main.browser_mgr._held
+        assert await _status_of(main.reset_profile(src["id"])) == 409
+    finally:
+        copy.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert copy.done.is_set()
+    assert copy.dst is not None and not copy.dst.exists()  # no orphaned clone dir
+    assert [p["id"] for p in db.list_profiles()] == [src["id"]]  # no row either
+    assert not main.browser_mgr._held
+    assert (Path(src["user_data_dir"]) / "Default" / "Cookies").read_text() == "session=abc"
+    assert await _status_of(main.reset_profile(src["id"])) == 200
+
+
+async def test_duplicate_state_cancellation_wins_over_a_late_worker_error(
+    tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A worker that fails AFTER the request was cancelled must not turn the
+    cancellation into a 500; either way nothing is left behind."""
+    src = _seeded_source()
+    copy = _PausableCopy()
+    copy.fail_with = OSError("disk full")
+    monkeypatch.setattr(main, "_copy_browser_state", copy)
+    task = asyncio.create_task(main.duplicate_profile(src["id"], _WITH_STATE))
+    assert await asyncio.to_thread(copy.started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    copy.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert copy.dst is not None and not copy.dst.exists()
+    assert [p["id"] for p in db.list_profiles()] == [src["id"]]
     assert not main.browser_mgr._held
 
 

@@ -719,6 +719,30 @@ def _copy_browser_state(src_dir: Path, dst_dir: Path) -> None:
     )
 
 
+async def _copy_browser_state_to_completion(src_dir: Path, dst_dir: Path) -> None:
+    """Run the copy in a worker thread and never return while it is running.
+
+    A thread cannot be interrupted, so a cancelled request would otherwise
+    release the source's hold and remove the clone directory while the worker
+    is still writing into it. Cancellation is absorbed until the worker is done,
+    then re-raised; a worker error propagates as-is.
+    """
+    worker = asyncio.ensure_future(asyncio.to_thread(_copy_browser_state, src_dir, dst_dir))
+    cancelled: asyncio.CancelledError | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except Exception:
+            pass  # the worker finished with an error; reported below
+    if cancelled is not None:
+        if not worker.cancelled():
+            worker.exception()  # retrieved; the cancellation is the outcome reported
+        raise cancelled
+    worker.result()
+
+
 @app.post("/api/profiles/{profile_id}/duplicate", response_model=ProfileResponse, status_code=201)
 async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None = None):
     """Clone a profile into a new profile (name suffixed ' (copy)').
@@ -760,10 +784,15 @@ async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None
         async with browser_mgr.hold_stopped(profile_id):
             if src_dir.is_dir():
                 # Off the event loop: a profile with a fat cache takes seconds to copy.
-                await asyncio.to_thread(_copy_browser_state, src_dir, dst_dir)
+                await _copy_browser_state_to_completion(src_dir, dst_dir)
             clone = db.duplicate_profile(profile_id, new_id=clone_id)
     except ProfileBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        # The worker has finished by now (the copy never returns while it runs)
+        # and no row was written, so the unpublished directory is safe to drop.
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        raise
     except Exception as exc:
         # No row to roll back — it is only written after a good copy — but the
         # directory must not outlive a failed attempt.

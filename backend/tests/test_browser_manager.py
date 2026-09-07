@@ -428,6 +428,53 @@ async def test_failed_launch_stays_active_until_its_context_is_closed(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_launch_is_refused_while_the_previous_browser_is_still_closing(monkeypatch):
+    """A relaunch during shutdown used to be admitted, and if it then failed its
+    cleanup cleared the shutdown's `_stopping` entry — leaving the still-closing
+    profile inactive to hold_stopped(). Now the relaunch is refused outright."""
+    manager = BrowserManager(DOCKER_RUNTIME)
+    closing, finish = asyncio.Event(), asyncio.Event()
+
+    async def blocked_close(*_args):
+        closing.set()
+        await finish.wait()
+
+    monkeypatch.setattr(manager, "_close_context", blocked_close)
+    manager.vnc.allocate = AsyncMock(return_value=(101, 6101))
+    manager.vnc.start_vnc = AsyncMock(side_effect=RuntimeError("Xvnc failed to start"))
+    manager.vnc.stop_vnc = AsyncMock()
+    manager.running["profile-1"] = RunningProfile("profile-1", object(), 19001, capture_preview=False)
+
+    stop = asyncio.create_task(manager.stop("profile-1"))
+    await asyncio.wait_for(closing.wait(), 2)
+    try:
+        assert manager.is_active("profile-1")
+        with pytest.raises(ProfileBusyError, match="still closing"):
+            await manager.launch({"id": "profile-1", "user_data_dir": "/nonexistent"})
+        # The refused launch touched nothing: the shutdown reservation is intact
+        assert not stop.done()
+        assert manager.is_active("profile-1")
+        manager.vnc.allocate.assert_not_awaited()
+    finally:
+        finish.set()
+        await stop
+    assert not manager.is_active("profile-1")
+
+
+def test_stopping_reservations_are_counted_per_operation():
+    """One operation's cleanup must never release another's reservation."""
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._reserve_stopping("p")
+    manager._reserve_stopping("p")
+    manager._release_stopping("p")
+    assert manager.is_active("p")
+    manager._release_stopping("p")
+    assert not manager.is_active("p")
+    manager._release_stopping("p")  # over-release is harmless
+    assert not manager.is_active("p")
+
+
+@pytest.mark.asyncio
 async def test_stop_releases_native_cdp_port():
     manager = BrowserManager(NATIVE_RUNTIME)
     context = MagicMock()

@@ -346,7 +346,10 @@ class BrowserManager:
         # the reason. get_status() returns this so the frontend can show it.
         self._last_errors: dict[str, dict[str, str]] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
-        self._stopping: set[str] = set()  # popped from running, context not yet closed
+        # Reservations held while a context is closing (stop(), a self-exit, a
+        # failed launch's cleanup). Counted per reservation so one operation's
+        # cleanup can never release another's; see _reserve_stopping().
+        self._stopping: dict[str, int] = {}
         # Profiles whose user_data_dir is reserved by a filesystem operation
         # (duplicate / reset / delete). launch() refuses these; see hold_stopped().
         self._held: set[str] = set()
@@ -433,6 +436,11 @@ class BrowserManager:
                 raise ProfileBusyError(
                     f"Profile {profile_id} is busy: its browser state is being copied or reset"
                 )
+            if profile_id in self._stopping:
+                # The previous browser is still closing. Starting another Chrome
+                # on the same directory now would fight it for the profile — and
+                # in Docker mode the launch would even delete its Singleton lock.
+                raise ProfileBusyError(f"Profile {profile_id} is still closing; retry shortly")
             if profile_id in self.running or profile_id in self._launching:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
@@ -647,7 +655,7 @@ class BrowserManager:
             # gap while a context may still be open, then clear it after cleanup.
             async with self._lock:
                 self._launching.discard(profile_id)
-                self._stopping.add(profile_id)
+                self._reserve_stopping(profile_id)
             try:
                 if context is not None:
                     await self._close_context(context, profile_id)
@@ -656,7 +664,7 @@ class BrowserManager:
                 if display is not None:
                     await self.vnc.stop_vnc(display)
             finally:
-                self._stopping.discard(profile_id)
+                self._release_stopping(profile_id)
             raise
 
     async def _ensure_search_engine(
@@ -860,13 +868,13 @@ class BrowserManager:
             self._record_denial_if_any(profile_id, running.denial_path)
             self.running.pop(profile_id, None)
             # Same contract as stop(): active until the dispose is really done.
-            self._stopping.add(profile_id)
+            self._reserve_stopping(profile_id)
 
         logger.info("Browser closed for profile %s, cleaning up", profile_id)
         try:
             await self._dispose_running(running, close_context=True)
         finally:
-            self._stopping.discard(profile_id)
+            self._release_stopping(profile_id)
 
     def _denial_error(self, denial_path: str | None) -> CloakBrowserLicenseError | None:
         """Read the wrapper's denial file → a license error, or None.
@@ -900,7 +908,7 @@ class BrowserManager:
         async with self._lock:
             running = self.running.pop(profile_id, None)
             if running:
-                self._stopping.add(profile_id)
+                self._reserve_stopping(profile_id)
 
         if not running:
             return
@@ -918,7 +926,19 @@ class BrowserManager:
                     )
             await self._dispose_running(running, close_context=True)
         finally:
-            self._stopping.discard(profile_id)
+            self._release_stopping(profile_id)
+
+    def _reserve_stopping(self, profile_id: str) -> None:
+        """Mark a context-close in progress for the profile (counted)."""
+        self._stopping[profile_id] = self._stopping.get(profile_id, 0) + 1
+
+    def _release_stopping(self, profile_id: str) -> None:
+        """Release ONE close reservation; the profile stays active while others remain."""
+        left = self._stopping.get(profile_id, 0) - 1
+        if left > 0:
+            self._stopping[profile_id] = left
+        else:
+            self._stopping.pop(profile_id, None)
 
     def is_active(self, profile_id: str) -> bool:
         """True while a browser owns the profile dir: launching, running or still

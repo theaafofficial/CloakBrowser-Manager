@@ -207,9 +207,9 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
     // Stays in the edit view — the profile is wiped but not launched.
   }, [selectedId, reset]);
 
-  const handleDuplicate = useCallback(async () => {
+  const handleDuplicate = useCallback(async (includeBrowserState: boolean) => {
     if (!selectedId) return;
-    const profile = await duplicate(selectedId);
+    const profile = await duplicate(selectedId, includeBrowserState);
     if (profile) {
       setSelectedId(profile.id);
       setView("edit");

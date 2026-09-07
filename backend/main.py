@@ -49,6 +49,7 @@ from .models import (
     LaunchResponse,
     LoginRequest,
     ProfileCreate,
+    ProfileDuplicateRequest,
     ProfileResponse,
     ProfileStatusResponse,
     ProfileUpdate,
@@ -692,18 +693,62 @@ async def reset_profile(profile_id: str):
     return _profile_response(updated)
 
 
-@app.post("/api/profiles/{profile_id}/duplicate", response_model=ProfileResponse, status_code=201)
-async def duplicate_profile(profile_id: str):
-    """Clone a profile's config into a new profile (name suffixed ' (copy)').
+# Never travels with a copy: Chromium's single-instance lock (SingletonLock is
+# a dangling symlink; a copy would make the clone think another Chrome owns its
+# dir) and the manager's preview frame, which shows the source, not the clone.
+_DUPLICATE_SKIP_FILES = frozenset({
+    "SingletonLock", "SingletonCookie", "SingletonSocket", SCREENSHOT_FILENAME,
+})
 
-    Config-only: settings, tags, notes and the same fingerprint seed are copied,
-    but no browser state — the clone gets a fresh, empty user_data_dir.
+
+def _copy_browser_state(src_dir: Path, dst_dir: Path) -> None:
+    """Copy a stopped profile's user_data_dir into a clone's, minus the skip list."""
+    shutil.copytree(
+        src_dir,
+        dst_dir,
+        symlinks=True,  # keep links as links; never follow one out of the dir
+        dirs_exist_ok=True,
+        ignore=lambda _dir, names: [n for n in names if n in _DUPLICATE_SKIP_FILES],
+    )
+
+
+@app.post("/api/profiles/{profile_id}/duplicate", response_model=ProfileResponse, status_code=201)
+async def duplicate_profile(profile_id: str, req: ProfileDuplicateRequest | None = None):
+    """Clone a profile into a new profile (name suffixed ' (copy)').
+
+    Settings, tags, notes and the same fingerprint seed are always copied. With
+    ``include_browser_state`` the source's user_data_dir (cookies, logged-in
+    sessions, history) is copied too, so the clone launches as the same identity
+    and the same session; the source must be stopped so the copy is consistent.
+    Without it (the default) the clone gets a fresh, empty user_data_dir.
     """
-    if not db.get_profile(profile_id):
+    profile = db.get_profile(profile_id)
+    if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
+    include_state = bool(req and req.include_browser_state)
+    if include_state and profile_id in browser_mgr.running:
+        raise HTTPException(
+            status_code=409, detail="Stop the profile before duplicating its browser state"
+        )
+
     clone = db.duplicate_profile(profile_id)
     if not clone:
         raise HTTPException(status_code=500, detail="Failed to duplicate profile")
+
+    src_dir = Path(profile["user_data_dir"])
+    if include_state and src_dir.is_dir():
+        dst_dir = Path(clone["user_data_dir"])
+        try:
+            # Off the event loop: a profile with a fat cache takes seconds to copy.
+            await asyncio.to_thread(_copy_browser_state, src_dir, dst_dir)
+        except OSError as exc:
+            # Roll back so a half-copied clone never shows up in the list.
+            db.delete_profile(clone["id"])
+            shutil.rmtree(dst_dir, ignore_errors=True)
+            logger.exception("Failed to copy browser state for duplicate of %s", profile_id)
+            raise HTTPException(
+                status_code=500, detail=f"Failed to copy browser state: {exc}"
+            ) from exc
     return _profile_response(clone)
 
 

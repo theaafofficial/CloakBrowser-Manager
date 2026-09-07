@@ -70,6 +70,15 @@ class ProfileUpdate(BaseModel):
         return value
 
 
+class ProfileDuplicateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Also copy the source's user_data_dir (cookies, logged-in sessions, history,
+    # local storage) so the clone launches as the same identity AND the same
+    # session. Off by default: the clone starts with fresh, empty browser state.
+    include_browser_state: bool = False
+
+
 class TagCreate(BaseModel):
     tag: str
     color: str | None = None

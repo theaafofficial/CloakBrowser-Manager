@@ -222,8 +222,11 @@ export const api = {
   resetProfile: (id: string) =>
     request<Profile>(`/api/profiles/${id}/reset`, { method: "POST" }),
 
-  duplicateProfile: (id: string) =>
-    request<Profile>(`/api/profiles/${id}/duplicate`, { method: "POST" }),
+  duplicateProfile: (id: string, includeBrowserState = false) =>
+    request<Profile>(`/api/profiles/${id}/duplicate`, {
+      method: "POST",
+      body: JSON.stringify({ include_browser_state: includeBrowserState }),
+    }),
 
   launchProfile: (id: string) =>
     request<LaunchResult>(`/api/profiles/${id}/launch`, { method: "POST" }),

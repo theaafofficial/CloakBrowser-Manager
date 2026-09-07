@@ -16,7 +16,7 @@ interface ProfileFormProps {
   onSave: (data: ProfileCreateData) => Promise<void>;
   onDelete?: () => Promise<void>;
   onReset?: () => Promise<void>;
-  onDuplicate?: () => Promise<void>;
+  onDuplicate?: (includeBrowserState: boolean) => Promise<void>;
   onCancel: () => void;
 }
 
@@ -70,7 +70,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
   const [deleting, setDeleting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resetDone, setResetDone] = useState(false);
-  const [duplicating, setDuplicating] = useState(false);
+  const [duplicating, setDuplicating] = useState<"config" | "state" | null>(null);
   const [testingProxy, setTestingProxy] = useState(false);
   const [proxyTest, setProxyTest] = useState<ProxyTestResult | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -186,20 +186,19 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
     }
   };
 
-  const handleDuplicate = async () => {
+  const handleDuplicate = async (includeBrowserState: boolean) => {
     if (!onDuplicate) return;
-    if (
-      !confirm(
-        "Duplicate this profile? A new profile with the same settings and " +
-          "fingerprint is created. Browser state (cookies, history) is not copied.",
-      )
-    )
-      return;
-    setDuplicating(true);
+    const message = includeBrowserState
+      ? "Duplicate this profile with its browser state? A new profile with the " +
+        "same settings, fingerprint, cookies and logged-in sessions is created."
+      : "Duplicate this profile? A new profile with the same settings and " +
+        "fingerprint is created. Browser state (cookies, history) is not copied.";
+    if (!confirm(message)) return;
+    setDuplicating(includeBrowserState ? "state" : "config");
     try {
-      await onDuplicate();
+      await onDuplicate(includeBrowserState);
     } finally {
-      setDuplicating(false);
+      setDuplicating(null);
     }
   };
 
@@ -256,12 +255,29 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
           {isEdit && onDuplicate && (
             <button
               type="button"
-              onClick={handleDuplicate}
-              disabled={duplicating}
+              onClick={() => handleDuplicate(false)}
+              disabled={duplicating !== null}
+              title="Duplicate settings and fingerprint only"
               className="btn-secondary flex items-center gap-1.5"
             >
               <Copy className="h-3.5 w-3.5" />
-              <span>{duplicating ? "Duplicating..." : "Duplicate"}</span>
+              <span>{duplicating === "config" ? "Duplicating..." : "Duplicate"}</span>
+            </button>
+          )}
+          {isEdit && onDuplicate && (
+            <button
+              type="button"
+              onClick={() => handleDuplicate(true)}
+              disabled={duplicating !== null || profile?.status !== "stopped"}
+              title={
+                profile?.status === "stopped"
+                  ? "Duplicate with cookies, logged-in sessions and history"
+                  : "Stop the profile first — browser state can only be copied while it is stopped"
+              }
+              className="btn-secondary flex items-center gap-1.5"
+            >
+              <Copy className="h-3.5 w-3.5" />
+              <span>{duplicating === "state" ? "Duplicating..." : "Duplicate with state"}</span>
             </button>
           )}
           {isEdit && onReset && (

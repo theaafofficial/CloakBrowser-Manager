@@ -4,6 +4,11 @@ All notable changes to CloakBrowser Manager are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Duplicate a profile together with its browser state.** `POST /api/profiles/{id}/duplicate` now accepts `{"include_browser_state": true}`, which copies the source profile's cookies, logged-in sessions, history and local storage into the clone alongside its settings and fingerprint — so the copy launches as the same identity *and* the same session. The source must be stopped (the request is refused with 409 otherwise), Chromium's single-instance lock files and the source's preview frame are left behind, and a failed copy removes the half-made clone. The profile editor gains a **Duplicate with state** button next to Duplicate. Without the flag the endpoint behaves exactly as before.
+
 ## [0.1.5] - 2026-08-30
 
 ### Fixed

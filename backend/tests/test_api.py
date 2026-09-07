@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -889,3 +890,125 @@ def test_reset_profile_preserves_search_engine_marker(app_client: TestClient):
     assert resp.status_code == 200
     assert marker.exists()
     assert marker.read_text().strip() == "google"
+
+
+# ── Duplicate ────────────────────────────────────────────────────────────────
+
+
+def _seed_browser_state(user_data_dir: Path) -> None:
+    """Lay down what a launched-then-stopped profile leaves on disk, lock included."""
+    default_dir = user_data_dir / "Default"
+    default_dir.mkdir(parents=True)
+    (user_data_dir / "Local State").write_text("{}")
+    (default_dir / "Cookies").write_text("session=abc")
+    (default_dir / "Preferences").write_text("{}")
+    (default_dir / "Local Storage").mkdir()
+    (default_dir / "Local Storage" / "leveldb").write_text("kv")
+    (user_data_dir / "last_screenshot.jpg").write_bytes(b"jpg")
+    (user_data_dir / "SingletonCookie").write_text("1")
+    try:
+        # Chromium's real lock is a dangling symlink to "<host>-<pid>".
+        os.symlink("host-12345", user_data_dir / "SingletonLock")
+    except OSError:  # symlink creation needs a privilege on some Windows hosts
+        (user_data_dir / "SingletonLock").write_text("host-12345")
+
+
+def test_duplicate_profile_not_found(app_client: TestClient):
+    resp = app_client.post("/api/profiles/nonexistent/duplicate")
+    assert resp.status_code == 404
+
+
+def test_duplicate_profile_is_config_only_by_default(app_client: TestClient):
+    create = app_client.post(
+        "/api/profiles", json={"name": "Src", "fingerprint_seed": 4242, "proxy": "http://host:8080"}
+    )
+    src = create.json()
+    _seed_browser_state(Path(src["user_data_dir"]))
+
+    resp = app_client.post(f"/api/profiles/{src['id']}/duplicate")
+    assert resp.status_code == 201
+    clone = resp.json()
+    assert clone["id"] != src["id"]
+    assert clone["name"] == "Src (copy)"
+    assert clone["fingerprint_seed"] == 4242
+    assert clone["proxy"] == "http://host:8080"
+    assert clone["user_data_dir"] != src["user_data_dir"]
+    # No browser state travels with a config-only clone
+    assert not Path(clone["user_data_dir"]).exists()
+
+
+def test_duplicate_profile_with_browser_state_copies_session(app_client: TestClient):
+    src = app_client.post("/api/profiles", json={"name": "Src", "fingerprint_seed": 4242}).json()
+    src_dir = Path(src["user_data_dir"])
+    _seed_browser_state(src_dir)
+
+    resp = app_client.post(f"/api/profiles/{src['id']}/duplicate", json={"include_browser_state": True})
+    assert resp.status_code == 201
+    clone = resp.json()
+    clone_dir = Path(clone["user_data_dir"])
+    assert clone_dir != src_dir
+    assert clone["fingerprint_seed"] == 4242
+    # Session state travels with the copy
+    assert (clone_dir / "Local State").read_text() == "{}"
+    assert (clone_dir / "Default" / "Cookies").read_text() == "session=abc"
+    assert (clone_dir / "Default" / "Preferences").read_text() == "{}"
+    assert (clone_dir / "Default" / "Local Storage" / "leveldb").read_text() == "kv"
+    # Chromium's single-instance lock and the source's preview frame do not
+    for name in ("SingletonLock", "SingletonCookie", "last_screenshot.jpg"):
+        assert not os.path.lexists(clone_dir / name), name
+    # The source is left exactly as it was
+    assert (src_dir / "Default" / "Cookies").read_text() == "session=abc"
+    assert os.path.lexists(src_dir / "SingletonLock")
+
+
+def test_duplicate_profile_with_browser_state_when_never_launched(app_client: TestClient):
+    """A source with no user_data_dir yet is fine: the clone simply starts empty."""
+    src = app_client.post("/api/profiles", json={"name": "Fresh"}).json()
+    resp = app_client.post(f"/api/profiles/{src['id']}/duplicate", json={"include_browser_state": True})
+    assert resp.status_code == 201
+    assert not Path(resp.json()["user_data_dir"]).exists()
+
+
+def test_duplicate_profile_with_browser_state_rejects_running_source(app_client: TestClient):
+    src = app_client.post("/api/profiles", json={"name": "Live"}).json()
+    pid = src["id"]
+    main.browser_mgr.running[pid] = MagicMock(spec=RunningProfile)
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/duplicate", json={"include_browser_state": True})
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+    assert resp.status_code == 409
+    # Nothing was created
+    assert [p["id"] for p in app_client.get("/api/profiles").json()] == [pid]
+
+
+def test_duplicate_profile_config_only_is_allowed_while_running(app_client: TestClient):
+    src = app_client.post("/api/profiles", json={"name": "Live"}).json()
+    pid = src["id"]
+    main.browser_mgr.running[pid] = MagicMock(spec=RunningProfile)
+    try:
+        resp = app_client.post(f"/api/profiles/{pid}/duplicate")
+    finally:
+        main.browser_mgr.running.pop(pid, None)
+    assert resp.status_code == 201
+
+
+def test_duplicate_profile_rolls_back_clone_when_copy_fails(
+    app_client: TestClient, tmp_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    src = app_client.post("/api/profiles", json={"name": "Src"}).json()
+    _seed_browser_state(Path(src["user_data_dir"]))
+    monkeypatch.setattr(main.shutil, "copytree", MagicMock(side_effect=OSError("disk full")))
+
+    resp = app_client.post(f"/api/profiles/{src['id']}/duplicate", json={"include_browser_state": True})
+    assert resp.status_code == 500
+    assert "disk full" in resp.json()["detail"]
+    # The half-made clone is gone from the DB and from disk
+    assert [p["id"] for p in app_client.get("/api/profiles").json()] == [src["id"]]
+    assert [d.name for d in (tmp_db / "profiles").iterdir()] == [src["id"]]
+
+
+def test_duplicate_profile_rejects_unknown_fields(app_client: TestClient):
+    src = app_client.post("/api/profiles", json={"name": "Src"}).json()
+    resp = app_client.post(f"/api/profiles/{src['id']}/duplicate", json={"copy_state": True})
+    assert resp.status_code == 422

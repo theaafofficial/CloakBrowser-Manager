@@ -277,7 +277,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
             {isEdit ? "Edit Profile" : "New Profile"}
           </h2>
           {isEdit && onDuplicate && (
-            <div ref={duplicateMenuRef} className="relative flex items-center">
+            <div ref={duplicateMenuRef} className="relative flex items-stretch">
               <button
                 type="button"
                 onClick={() => handleDuplicate(false)}
@@ -296,7 +296,7 @@ export function ProfileForm({ profile, hostOs, viewerMode, onSave, onDelete, onR
                 aria-haspopup="menu"
                 aria-expanded={duplicateMenuOpen}
                 aria-label="Duplicate options"
-                className="btn-secondary rounded-l-none border-l border-border px-1.5"
+                className="btn-secondary flex items-center rounded-l-none border-l border-border px-2"
               >
                 <ChevronDown className="h-3.5 w-3.5" />
               </button>

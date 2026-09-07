@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +14,7 @@ from backend.browser_manager import (
     _normalize_proxy,
     _validate_proxy,
     BrowserManager,
+    ProfileBusyError,
     RunningProfile,
     SEARCH_ENGINE_MARKER,
 )
@@ -380,6 +382,49 @@ async def test_launch_retries_failed_cdp_and_closes_first_context(
     assert launch.await_count == 2
     first_context.close.assert_awaited_once()
     assert running.cdp_port in manager._cdp_ports
+
+
+@pytest.mark.asyncio
+async def test_failed_launch_stays_active_until_its_context_is_closed(monkeypatch, tmp_path: Path):
+    """A launch that fails AFTER the browser is up must keep the profile active
+    while the half-launched context is being closed — the failure path used to
+    drop _launching before awaiting the close, leaving a window in which
+    hold_stopped() (duplicate / reset / delete) would touch a live profile dir."""
+    from backend import browser_manager as module
+
+    context = MagicMock(pages=[])
+    context.on = MagicMock(side_effect=RuntimeError("post-startup wiring failed"))
+    closing, finish = asyncio.Event(), asyncio.Event()
+
+    async def blocked_close(*_args):
+        closing.set()
+        await finish.wait()
+
+    manager = BrowserManager(NATIVE_RUNTIME)
+    manager._wait_for_cdp = AsyncMock()
+    manager._ensure_search_engine = AsyncMock()
+    monkeypatch.setattr(manager, "_close_context", blocked_close)
+    monkeypatch.setattr(module, "launch_persistent_context_async", AsyncMock(return_value=context))
+    profile = _launch_profile(tmp_path)
+    pid = profile["id"]
+
+    task = asyncio.create_task(manager.launch(profile))
+    await asyncio.wait_for(closing.wait(), 2)
+    try:
+        assert pid not in manager._launching  # the exact window: cleanup pending
+        assert manager.is_active(pid)
+        with pytest.raises(ProfileBusyError):
+            async with manager.hold_stopped(pid):
+                pass
+    finally:
+        finish.set()
+    with pytest.raises(RuntimeError, match="post-startup wiring failed"):
+        await task
+
+    # Once cleanup has finished the profile is genuinely stopped again
+    assert not manager.is_active(pid)
+    async with manager.hold_stopped(pid):
+        pass
 
 
 @pytest.mark.asyncio

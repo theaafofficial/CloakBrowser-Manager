@@ -642,14 +642,21 @@ class BrowserManager:
             return running
 
         except BaseException:
+            # Stay "active" until the half-launched browser is really gone: swap
+            # _launching for _stopping under the lock so is_active() never sees a
+            # gap while a context may still be open, then clear it after cleanup.
             async with self._lock:
                 self._launching.discard(profile_id)
-            if context is not None:
-                await self._close_context(context, profile_id)
-            if cdp_port is not None:
-                self._release_cdp_port(cdp_port)
-            if display is not None:
-                await self.vnc.stop_vnc(display)
+                self._stopping.add(profile_id)
+            try:
+                if context is not None:
+                    await self._close_context(context, profile_id)
+                if cdp_port is not None:
+                    self._release_cdp_port(cdp_port)
+                if display is not None:
+                    await self.vnc.stop_vnc(display)
+            finally:
+                self._stopping.discard(profile_id)
             raise
 
     async def _ensure_search_engine(
